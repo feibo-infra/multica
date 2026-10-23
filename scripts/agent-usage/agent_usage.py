@@ -301,12 +301,18 @@ def load_events(path):
             if event.get("verdict") not in {"completed", "accepted", "rework"} or not event.get("issue_id"):
                 raise ValueError("delivery needs issue_id and explicit verdict")
             stamp(event["at"])
+            if not isinstance(event.get("run_ids", []), list):
+                raise ValueError("delivery run_ids must be an array")
         if event["kind"] == "optimization":
             stamp(event["effective_at"])
         if event["kind"] == "fallback":
             if event.get("result") not in {"success", "failure", "pending", "unknown"}:
                 raise ValueError("fallback needs an explicit result")
             stamp(event["triggered_at"])
+            if event.get("duplicate_execution") is not None and type(event["duplicate_execution"]) is not bool:
+                raise ValueError("fallback duplicate_execution must be boolean or null")
+            if event.get("started_at") and stamp(event["started_at"]) < stamp(event["triggered_at"]):
+                raise ValueError("fallback cannot start before it is triggered")
         if event["id"] in events and events[event["id"]] != event:
             raise ValueError("conflicting observation id")
         events[event["id"]] = event

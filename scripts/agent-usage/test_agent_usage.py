@@ -211,6 +211,20 @@ class ReportTests(unittest.TestCase):
                     u.daily(args)
                 collect.assert_not_called()
 
+    def test_observation_conflicts_and_malformed_boolean_are_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "observations.jsonl"
+            event = {"kind": "fallback", "id": "switch", "result": "unknown",
+                     "triggered_at": "2026-10-18T00:00:00Z", "duplicate_execution": "false", "evidence_ref": "ledger"}
+            path.write_text(json.dumps(event))
+            with self.assertRaisesRegex(ValueError, "boolean"):
+                u.load_events(path)
+            event["duplicate_execution"] = None
+            changed = {**event, "result": "success"}
+            path.write_text(json.dumps(event) + "\n" + json.dumps(changed))
+            with self.assertRaisesRegex(ValueError, "conflicting"):
+                u.load_events(path)
+
 
 if __name__ == "__main__":
     unittest.main()
