@@ -16,7 +16,7 @@ import subprocess
 import sys
 from zoneinfo import ZoneInfo
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 TOKENS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")
 TERMINAL = {"completed", "failed", "cancelled"}
 CURSOR = re.compile(r'More runs available; use --before "([^"\n]+)"')
@@ -158,8 +158,6 @@ def page_agent(cli, agent_id, lower, upper, max_pages):
                       "oldest": iso(min(times)) if times else None})
         crossed = bool(times and min(times) < lower)
         if crossed or not next_cursor:
-            if not next_cursor and len(rows) == 200 and not crossed:
-                raise ValueError("full page without next cursor; completeness cannot be established")
             return list(runs.values()), {"agent_id": agent_id, "lower": iso(lower), "upper": iso(upper),
                 "pages": pages, "unique_runs": len(runs), "duplicate_rows": duplicate_rows,
                 "complete": True, "stop": "crossed_lower_bound" if crossed else "exhausted"}
@@ -171,7 +169,8 @@ def page_agent(cli, agent_id, lower, upper, max_pages):
 
 
 def database(state):
-    state.mkdir(parents=True, exist_ok=True)
+    state.mkdir(parents=True, exist_ok=True, mode=0o700)
+    state.chmod(0o700)
     db = sqlite3.connect(state / "runs.sqlite")
     db.execute("CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, body TEXT NOT NULL)")
     db.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, body TEXT NOT NULL)")
@@ -189,7 +188,8 @@ def set_meta(db, key, value):
 
 @contextmanager
 def state_lock(state):
-    state.mkdir(parents=True, exist_ok=True)
+    state.mkdir(parents=True, exist_ok=True, mode=0o700)
+    state.chmod(0o700)
     with (state / "collection.lock").open("a") as handle:
         try:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -291,7 +291,7 @@ def load_events(path):
         if not line.strip():
             continue
         event = json.loads(line)
-        if not event.get("id") or not event.get("evidence_ref"):
+        if not event.get("id") or not event.get("evidence_ref") or not event.get("kind"):
             raise ValueError("each observation needs a stable id and evidence_ref")
         if event["kind"] not in {"no_change", "fallback", "delivery", "optimization"}:
             raise ValueError("unknown observation kind")
@@ -300,14 +300,20 @@ def load_events(path):
         if event["kind"] == "delivery":
             if event.get("verdict") not in {"completed", "accepted", "rework"} or not event.get("issue_id"):
                 raise ValueError("delivery needs issue_id and explicit verdict")
+            if not event.get("at"):
+                raise ValueError("delivery needs at")
             stamp(event["at"])
             if not isinstance(event.get("run_ids", []), list):
                 raise ValueError("delivery run_ids must be an array")
         if event["kind"] == "optimization":
+            if not event.get("effective_at"):
+                raise ValueError("optimization needs effective_at")
             stamp(event["effective_at"])
         if event["kind"] == "fallback":
             if event.get("result") not in {"success", "failure", "pending", "unknown"}:
                 raise ValueError("fallback needs an explicit result")
+            if not event.get("triggered_at"):
+                raise ValueError("fallback needs triggered_at")
             stamp(event["triggered_at"])
             if event.get("duplicate_execution") is not None and type(event["duplicate_execution"]) is not bool:
                 raise ValueError("fallback duplicate_execution must be boolean or null")
@@ -340,12 +346,32 @@ def add_usage(group, usages):
     group["usage_missing_rate"] = group["usage_missing_runs"] / group["runs"]
 
 
+def model_usage(runs):
+    groups = {}
+    for run in runs:
+        usages = {}
+        for row in run["usage"]:
+            usages.setdefault((row["provider"], row["model"]), []).append(row)
+        if not usages:
+            usages[("unknown", "unknown")] = []
+        for key, rows in usages.items():
+            add_usage(groups.setdefault(key, bucket()), rows)
+    return [{"provider": k[0], "model": k[1], **v} for k, v in sorted(groups.items())]
+
+
+def run_coverage(runs):
+    missing = sum(not r["usage"] for r in runs)
+    return {"runs": len(runs), "usage_missing_runs": missing,
+            "usage_missing_rate": missing / len(runs) if runs else None}
+
+
 def quota_repeats(runs):
     known, repeated, unknown = {}, [], []
     # Knowledge starts when the failing run ends, not when it was created.
     actions = []
     for r in runs:
-        actions.append((stamp(r.get("started_at") or r["created_at"]), 0, r))
+        if r.get("started_at"):
+            actions.append((stamp(r["started_at"]), 0, r))
         if r["failure_category"] == "Claude quota" and r.get("completed_at"):
             actions.append((stamp(r["completed_at"]), 1, r))
         elif r["status"] == "completed" and r["usage"] and r.get("completed_at"):
@@ -395,7 +421,7 @@ def summarize(all_runs, since, until, zone, events, mapping):
     date = since.astimezone(zone).date()
     last_date = (until - timedelta(microseconds=1)).astimezone(zone).date()
     while date <= last_date:
-        daily[date.isoformat()] = {"usage": bucket(), "same_agent_issue_repeat_starts": 0}
+        daily[date.isoformat()] = {"same_agent_issue_repeat_starts": 0}
         date += timedelta(days=1)
     annotations = {e["run_id"]: e for e in events if e["kind"] == "no_change"}
     no_change = []
@@ -407,8 +433,6 @@ def summarize(all_runs, since, until, zone, events, mapping):
         statuses[r["status"]] = statuses.get(r["status"], 0) + 1
         if r["failure_category"]:
             failures[r["failure_category"]] = failures.get(r["failure_category"], 0) + 1
-        daily.setdefault(day, {"usage": bucket(), "same_agent_issue_repeat_starts": 0})
-        add_usage(daily[day]["usage"], r["usage"])
         if r["id"] in annotations:
             no_change.append({"run_id": r["id"], "day": day, "usage": r["usage"],
                               "evidence_ref": annotations[r["id"]]["evidence_ref"]})
@@ -426,7 +450,7 @@ def summarize(all_runs, since, until, zone, events, mapping):
             add_usage(groups.setdefault(key, bucket()), usages)
     repeat_keys = {}
     for r in selected:
-        if r.get("issue_id"):
+        if r.get("issue_id") and r.get("started_at"):
             day = stamp(r["created_at"]).astimezone(zone).date().isoformat()
             k = (day, r["agent_id"], r["issue_id"])
             if k in repeat_keys:
@@ -443,7 +467,10 @@ def summarize(all_runs, since, until, zone, events, mapping):
             fallback.append(item)
     # A blank ledger means uncollected, not zero accepted/reworked tasks.
     for day in {stamp(e["at"]).astimezone(zone).date().isoformat() for e in deliveries} | set(daily):
-        d = daily.setdefault(day, {"usage": bucket(), "same_agent_issue_repeat_starts": 0})
+        d = daily.setdefault(day, {"same_agent_issue_repeat_starts": 0})
+        day_runs = [r for r in selected if stamp(r["created_at"]).astimezone(zone).date().isoformat() == day]
+        d["coverage"] = run_coverage(day_runs)
+        d["model_usage"] = model_usage(day_runs)
         de = [e for e in deliveries if stamp(e["at"]).astimezone(zone).date().isoformat() == day]
         d["delivery_coverage"] = "explicit_observations_only" if de else "not_collected"
         for verdict in ("completed", "accepted", "rework"):
@@ -451,15 +478,13 @@ def summarize(all_runs, since, until, zone, events, mapping):
     units = []
     for e in deliveries:
         linked = [by_id[rid] for rid in dict.fromkeys(e.get("run_ids", [])) if rid in by_id]
-        usage = bucket()
-        for r in linked:
-            add_usage(usage, r["usage"])
         units.append({"observation_id": e["id"], "issue_id": e["issue_id"], "verdict": e["verdict"],
                       "task_type": e.get("task_type", "unknown"), "stage": e.get("stage", "unknown"),
                       "day": stamp(e["at"]).astimezone(zone).date().isoformat(),
                       "optimization_phases": {o["id"]: "after" if stamp(e["at"]) >= stamp(o["effective_at"]) else "before"
                                               for o in events if o["kind"] == "optimization"},
-                      "linked_run_usage": usage, "missing_linked_run_ids": sorted(set(e.get("run_ids", [])) - set(by_id)),
+                      "linked_run_coverage": run_coverage(linked), "model_usage": model_usage(linked),
+                      "missing_linked_run_ids": sorted(set(e.get("run_ids", [])) - set(by_id)),
                       "attribution": "explicit run links only; unlinked consumption excluded"})
     fields = ("day", "runtime_id", "machine", "agent_id", "issue_id", "provider", "model", "account_alias", "account_evidence_level")
     return {"window": {"since": iso(since), "until": iso(until), "timezone": str(zone)},
@@ -468,6 +493,8 @@ def summarize(all_runs, since, until, zone, events, mapping):
         "groups": [{**dict(zip(fields, k)), **v} for k, v in groups.items()], "daily": daily,
         "audited_no_change": no_change, "no_change_coverage": "audited observations only; unannotated runs unknown",
         "known_long_quota_repeat_starts": repeated,
+        "missing_started_at_run_ids": [r["id"] for r in selected if not r.get("started_at")],
+        "unmatched_no_change_run_ids": sorted(set(annotations) - selected_ids),
         "quota_unknown_reset_run_ids": [rid for rid in unknown_resets if rid in selected_ids],
         "same_agent_issue_overlaps": overlaps(selected), "overlap_interpretation": "candidates, not proven duplicate work; only closed intervals",
         "fallback": {"coverage": "explicit_observations_only" if fallback else "not_collected",
@@ -482,6 +509,10 @@ def summarize(all_runs, since, until, zone, events, mapping):
             "Token buckets remain separate; no inferred monetary cost.",
             "Missing model usage cannot be attributed using the agent's current model.",
             "Quota repetition is runtime-scoped; historical shared-account identity is unknown.",
+            "Failure categories are keyword heuristics, not verified root causes.",
+            "Historical input-token normalization is not established; provider/model rows remain separate.",
+            "Stored zero cannot distinguish a reported zero from a provider field defaulted to zero.",
+            "The platform hides some unstarted fallback/deferred/cancelled runs from this listing.",
             "A paginated collection is not a transactionally consistent server snapshot.",
             "Terminal runs may report usage later; refresh the historical range when reconciling."]}
 
@@ -498,6 +529,9 @@ def report(args):
         runs = [json.loads(row[0]) for row in db.execute("SELECT body FROM runs")]
         mapping = json.loads(args.mapping.read_text()) if args.mapping else {}
         result = summarize(runs, since, until, ZoneInfo(args.timezone), load_events(args.observations), mapping)
+        expected = getattr(args, "expect_no_change", None)
+        if expected is not None and len(result["audited_no_change"]) != expected:
+            raise ValueError(f"expected {expected} audited no-change runs, found {len(result['audited_no_change'])}; check unmatched_no_change_run_ids")
         result["provenance"] = {"version": VERSION, "source_sha256": fingerprint(__file__),
             "collected_at": collection["collected_at"],
             "collection_manifest_sha256": hashlib.sha256((json.dumps(collection, ensure_ascii=False, indent=2) + "\n").encode()).hexdigest(),
@@ -519,6 +553,9 @@ def daily(args):
     end = start + timedelta(days=1)
     if end.astimezone(timezone.utc) > stamp(args.until):
         raise ValueError("daily reporting requires a complete day before the collection cutoff")
+    load_events(args.observations)
+    if args.mapping:
+        json.loads(args.mapping.read_text())
     collect(args)
     args.output = args.output_dir / (day.isoformat() + ".json")
     args.since, args.until = iso(start), iso(end)
@@ -588,6 +625,7 @@ def main():
             c.add_argument("--observations", type=Path)
             c.add_argument("--mapping", type=Path)
             c.add_argument("--output-dir", type=Path, required=True)
+            c.add_argument("--expect-no-change", type=int)
         c.set_defaults(func=func)
     r = sub.add_parser("report")
     for name in ("state", "observations", "mapping", "output"):
@@ -595,6 +633,7 @@ def main():
     r.add_argument("--since", required=True)
     r.add_argument("--until", required=True)
     r.add_argument("--timezone", default="Asia/Shanghai")
+    r.add_argument("--expect-no-change", type=int)
     r.set_defaults(func=report)
     v = sub.add_parser("verify-prior")
     v.add_argument("--prior", type=Path, required=True)

@@ -45,6 +45,7 @@ an arbitrary collected window does not contact the server:
 python3 scripts/agent-usage/agent_usage.py report \
   --state /path/to/private-state \
   --since 2026-10-12T02:35:00Z --until 2026-10-19T02:35:00Z \
+  --expect-no-change 26 \
   --output /path/to/baseline.json
 ```
 
@@ -57,8 +58,9 @@ that failure using its own notification channel.
 ## Completeness and failure behavior
 
 - A collection commits only after **every** agent finishes its pages. A CLI
-  error, timeout, malformed response, repeated cursor, page limit or unexplained
-  full page without a cursor fails the collection and keeps its watermark.
+  error, timeout, malformed response, repeated cursor or page limit fails the
+  collection and keeps its watermark. A full terminal page without a cursor is
+  valid: the current CLI exposes the server's authoritative next-cursor header.
 - Calls have a timeout (60 seconds by default), a page cap (500 per agent),
   bounded concurrency (4, maximum 8) and no automatic retries. stdout JSON and
   stderr pagination metadata are parsed separately. Raw error output is not
@@ -71,12 +73,16 @@ that failure using its own notification channel.
   exit. Do not delete it to break a live process's lock. An interrupted run can
   be rerun with the same state. State commits are atomic SQLite transactions;
   `collection.json` is an exported copy of metadata stored in the database.
+  The dedicated state directory is restricted to its owner (0700).
 - A cutoff cannot be in the future. Pagination is not a transactionally
   consistent server snapshot; statuses and usage are observed at collection
   time, while membership in the window is by run creation time.
 - Final usage can arrive more than 48 hours late. For historical reconciliation,
   run `collect --refresh-since <timestamp>` in addition to the usual flags.
   Final missing-usage rows remain unknown until such a refresh supplies usage.
+  An indefinitely unfinished run keeps its agent's lookback open and can
+  eventually hit the page cap; this remains a visible collection failure,
+  rather than silently abandoning the run.
 - Reports outside the successful collection window are refused. All IDs and
   coverage remain available for review; the collector cannot see inaccessible
   or permanently deleted agents and does not claim whole-provider billing
@@ -89,10 +95,16 @@ provider and model. An absent usage report is its own `unknown` model group;
 the current agent model is never used to reconstruct historical consumption.
 `usage_missing_runs` and `usage_missing_rate` are per group, with a separate
 global missing-run count. Each of the four token buckets has `reported_sum`,
-`reported_rows` and `missing_rows`. All-unobserved sums are `null`; a reported
-zero stays zero. Buckets are not added into a price or total token equivalent.
-The CLI's normalized input count excludes both cache buckets; the collector
-does not reinterpret provider-native counters or re-add reasoning output.
+`reported_rows` and `missing_rows`. All-unobserved sums are `null`; an integer
+zero from the API stays zero. The database defaults absent provider counters to
+zero, so this API cannot distinguish a real zero from an unreported cache
+counter. Buckets are not added into a price or total token equivalent.
+Recent adapters normalize input to exclude both cache buckets, but the
+normalization/backfill deployment time for historical rows is not established.
+The collector preserves the API counters, separates every provider/model in
+both daily and unit-delivery output, and does not re-add reasoning output.
+Daily `coverage` contains run counts and missing rates only; `model_usage`
+contains each provider/model's separate token buckets.
 
 The daily output includes completed/accepted/rework task counts only from
 explicit observations. `completed` **run** status is never treated as a
@@ -105,19 +117,25 @@ Repeated starts on the same agent/issue/day and closed execution intervals
 that overlap are diagnostic candidates. They do not prove repeated business
 work. Long-quota repetition requires a previous quota failure to have ended,
 an explicitly parsed reset at least 30 minutes later, and another start before
-that reset on the same runtime. A completed run with reported usage clears the
+that reset on the same runtime. Only runs with an actual `started_at` qualify;
+missing start times appear separately in `missing_started_at_run_ids`.
+A completed run with reported usage clears the
 runtime interval. Cross-runtime shared-account history is not inferred.
 `quota_unknown_reset_run_ids` retains parse gaps. These are not counted as
 known timed intervals.
 
-`audited_no_change` links reviewed run IDs to evidence. `fallback.events`
+`audited_no_change` links reviewed run IDs to evidence.
+`unmatched_no_change_run_ids` lists samples absent from the database or outside
+the report window; `--expect-no-change N` fails explicitly on a count mismatch.
+`fallback.events`
 retain explicit success/failure/pending/unknown, continuation delay and known
 or unknown duplicate execution. `unit_deliveries` count consumption only for
 explicitly linked, deduplicated run IDs, including links created before the
 report day. They retain missing links, task type, stage and before/after labels
 for each recorded optimization. Compare matching task types and stages, and
 keep usage coverage visible. They do not claim all unlinked cost belongs to
-that delivery. `optimizations` records observed effective times, not planned
+that delivery. Linked consumption also remains separated by provider/model.
+`optimizations` records observed effective times, not planned
 rollout dates.
 
 ## Observation and mapping contracts
@@ -169,6 +187,10 @@ python3 scripts/agent-usage/agent_usage.py verify-prior \
 The verifier does not pretend aggregate-only prior evidence contains all run
 IDs. Compare a fresh collection's creation-window count and common IDs, while
 allowing documented final-state/late-usage drift.
+The platform hides some unstarted fallback/deferred/cancelled tasks from agent
+run listings. Counts are visible listed runs, not every internal task record.
+Failure classifications are keyword heuristics, not independently verified
+root causes.
 
 ## Validation and rollback
 
