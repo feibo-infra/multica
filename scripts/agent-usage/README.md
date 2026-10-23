@@ -74,6 +74,16 @@ that failure using its own notification channel.
   be rerun with the same state. State commits are atomic SQLite transactions;
   `collection.json` is an exported copy of metadata stored in the database.
   The dedicated state directory is restricted to its owner (0700).
+- Both JSON exports are prepared under `pending-export/` before SQLite commits,
+  then published only after the commit succeeds. A preparation or commit failure
+  leaves both the database and the visible manifest at the previous snapshot.
+  Publication cannot be atomic with SQLite: a failure after commit may leave
+  an older export. The failure record then states `watermark_advanced: true`,
+  `committed_until`, and `exports_pending: true`. The next collection repairs
+  `collection.json` from SQLite before contacting the server. Reports always
+  read the authoritative SQLite metadata. If even the failure record cannot be
+  written, the same commit information is printed to stderr and the original
+  error remains visible.
 - A cutoff cannot be in the future. Pagination is not a transactionally
   consistent server snapshot; statuses and usage are observed at collection
   time, while membership in the window is by run creation time.
@@ -176,6 +186,10 @@ The optional `verify-prior` command accepts an extracted archive containing
 `nochange-evidence.json`. It validates hashes, run/model uniqueness, failure
 IDs, group totals, and each audited sample's usage. It can export the reviewed
 sample IDs as observations, avoiding another model-based analysis:
+
+Include **every file named by the prior archive's `SHA256SUMS.json`**, even
+files not otherwise consumed by the verifier. Preserve the checksum list
+unchanged. Verify the delivered archive from a newly extracted directory.
 
 ```sh
 python3 scripts/agent-usage/agent_usage.py verify-prior \

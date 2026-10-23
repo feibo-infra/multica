@@ -3,6 +3,7 @@ from datetime import timedelta
 import importlib.util
 import json
 from pathlib import Path
+import sqlite3
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -39,6 +40,97 @@ class FakeCLI:
 
 
 class CollectorTests(unittest.TestCase):
+    def collection_args(self, state):
+        return argparse.Namespace(state=state, since=START, until=END, cli="multica",
+            timeout=1, workers=1, max_pages=5, lookback_hours=48, refresh_since=None)
+
+    def collect_fixture(self, args, output=10):
+        cli = FakeCLI([([{"id": "a"}], ""), ([], ""),
+                       ([task(usage=[usage(output_tokens=output)])], "")])
+        with patch.object(u, "CLI", return_value=cli):
+            u.collect(args)
+
+    def snapshot(self, state):
+        with sqlite3.connect(state / "runs.sqlite") as db:
+            return (db.execute("SELECT * FROM runs ORDER BY id").fetchall(),
+                    db.execute("SELECT * FROM metadata ORDER BY key").fetchall(),
+                    (state / "collection.json").read_bytes())
+
+    def test_success_record_write_failure_keeps_database_and_export_unchanged(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state = Path(temp)
+            args = self.collection_args(state)
+            self.collect_fixture(args)
+            before = self.snapshot(state)
+            args.until = "2026-10-19T01:00:00Z"
+            real_write = u.write_json
+            def fail_success_record(path, value):
+                if Path(path).name == "last-attempt.json" and value.get("ok") is True:
+                    raise OSError("injected success record write failure")
+                return real_write(path, value)
+            with patch.object(u, "write_json", side_effect=fail_success_record):
+                with self.assertRaisesRegex(OSError, "success record"):
+                    self.collect_fixture(args, output=12)
+            self.assertEqual(self.snapshot(state), before)
+            attempt = json.loads((state / "last-attempt.json").read_text())
+            self.assertFalse(attempt["watermark_advanced"])
+
+    def test_real_sqlite_commit_failure_does_not_publish_prepared_exports(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state = Path(temp)
+            args = self.collection_args(state)
+            self.collect_fixture(args)
+            before = self.snapshot(state)
+            reader = sqlite3.connect(state / "runs.sqlite")
+            reader.execute("BEGIN")
+            reader.execute("SELECT * FROM runs").fetchall()
+            args.until = "2026-10-19T01:00:00Z"
+            real_database = u.database
+            def no_wait_database(path):
+                db = real_database(path)
+                db.execute("PRAGMA busy_timeout=0")
+                return db
+            try:
+                with patch.object(u, "database", side_effect=no_wait_database):
+                    with self.assertRaisesRegex(sqlite3.OperationalError, "locked"):
+                        self.collect_fixture(args, output=12)
+            finally:
+                reader.rollback()
+                reader.close()
+            self.assertEqual(self.snapshot(state), before)
+            self.assertFalse(json.loads((state / "last-attempt.json").read_text())["watermark_advanced"])
+            prepared = json.loads((state / "pending-export" / "collection.json").read_text())
+            self.assertEqual(prepared["until"], args.until)
+
+    def test_publish_failure_reports_commit_and_repairs_before_network_retry(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state = Path(temp)
+            args = self.collection_args(state)
+            self.collect_fixture(args)
+            old_export = (state / "collection.json").read_bytes()
+            args.until = "2026-10-19T01:00:00Z"
+            real_replace = Path.replace
+            def fail_publish(path, target):
+                if path.parent.name == "pending-export" and Path(target) == state / "collection.json":
+                    raise OSError("injected publish failure")
+                return real_replace(path, target)
+            with patch.object(Path, "replace", fail_publish):
+                with self.assertRaisesRegex(OSError, "publish failure"):
+                    self.collect_fixture(args, output=12)
+            self.assertEqual((state / "collection.json").read_bytes(), old_export)
+            attempt = json.loads((state / "last-attempt.json").read_text())
+            self.assertTrue(attempt["watermark_advanced"])
+            self.assertTrue(attempt["exports_pending"])
+            self.assertEqual(attempt["committed_until"], args.until)
+            with patch.object(u, "CLI", return_value=FakeCLI([RuntimeError("offline")])):
+                with self.assertRaisesRegex(RuntimeError, "offline"):
+                    u.collect(args)
+            with sqlite3.connect(state / "runs.sqlite") as db:
+                current = u.meta(db, "collection")
+                run = json.loads(db.execute("SELECT body FROM runs").fetchone()[0])
+            self.assertEqual(json.loads((state / "collection.json").read_text()), current)
+            self.assertEqual(run["usage"][0]["output_tokens"], 12)
+
     def test_precise_cursor_and_id_deduplication(self):
         cursor = "2026-10-18T00:00:00.123456Z|r1"
         cli = FakeCLI([([task()], f'More runs available; use --before "{cursor}" to fetch the next page.'),

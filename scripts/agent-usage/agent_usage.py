@@ -16,7 +16,7 @@ import subprocess
 import sys
 from zoneinfo import ZoneInfo
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 TOKENS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")
 TERMINAL = {"completed", "failed", "cancelled"}
 CURSOR = re.compile(r'More runs available; use --before "([^"\n]+)"')
@@ -186,6 +186,26 @@ def set_meta(db, key, value):
     db.execute("INSERT OR REPLACE INTO metadata VALUES (?, ?)", (key, json.dumps(value)))
 
 
+def collection_export_matches(db, state):
+    current = meta(db, "collection")
+    path = state / "collection.json"
+    if current is None:
+        return not path.exists()
+    try:
+        return json.loads(path.read_text()) == current
+    except (OSError, ValueError):
+        return False
+
+
+def repair_collection_export(db, state):
+    if not collection_export_matches(db, state):
+        current = meta(db, "collection")
+        if current is None:
+            (state / "collection.json").unlink(missing_ok=True)
+        else:
+            write_json(state / "collection.json", current)
+
+
 @contextmanager
 def state_lock(state):
     state.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -203,6 +223,7 @@ def collect(args):
         db = database(args.state)
         committed = False
         try:
+            repair_collection_export(db, args.state)
             code_sha = fingerprint(__file__)
             old = meta(db, "collection")
             since, until = stamp(args.since), stamp(args.until)
@@ -258,15 +279,22 @@ def collect(args):
                 "until": iso(until), "collected_at": completed, "complete": True,
                 "agent_count": len(agent_ids), "fetched_unique_runs": len(results),
                 "agents": sorted(manifests, key=lambda m: m["agent_id"])}
+            pending_export = args.state / "pending-export"
+            success = {"ok": True, "at": completed, "until": iso(until),
+                       "watermark_advanced": True, "exports_pending": False}
             with db:
                 for run in results:
                     db.execute("INSERT OR REPLACE INTO runs VALUES (?, ?)", (run["id"], json.dumps(run)))
                 set_meta(db, "agents", [{k: a.get(k) for k in ("id", "name", "runtime_id", "model", "archived_at")} for a in agents])
                 set_meta(db, "runtimes", [{k: r.get(k) for k in ("id", "name")} for r in runtimes])
                 set_meta(db, "collection", manifest)
-                write_json(args.state / "collection.json", manifest)
-                write_json(args.state / "last-attempt.json", {"ok": True, "at": completed, "until": iso(until)})
+                # Prepare both files without exposing uncommitted progress.
+                write_json(pending_export / "collection.json", manifest)
+                write_json(pending_export / "last-attempt.json", success)
             committed = True
+            # SQLite is authoritative. A failed publication may lag it, never lead it.
+            (pending_export / "collection.json").replace(args.state / "collection.json")
+            (pending_export / "last-attempt.json").replace(args.state / "last-attempt.json")
             try:
                 for cache in (args.state / "staging").glob("*.json"):
                     cache.unlink(missing_ok=True)
@@ -276,8 +304,15 @@ def collect(args):
                               "stored_unique_runs": db.execute("SELECT COUNT(*) FROM runs").fetchone()[0],
                               "agents": len(agent_ids), "until": iso(until)}))
         except Exception as exc:
-            write_json(args.state / "last-attempt.json", {"ok": False, "at": iso(datetime.now(timezone.utc)),
-                       "error": str(exc), "watermark_advanced": committed})
+            current = meta(db, "collection")
+            attempt = {"ok": False, "at": iso(datetime.now(timezone.utc)), "error": str(exc),
+                       "watermark_advanced": committed, "committed_until": current["until"] if current else None,
+                       "requested_until": args.until,
+                       "exports_pending": committed or not collection_export_matches(db, args.state)}
+            try:
+                write_json(args.state / "last-attempt.json", attempt)
+            except OSError:
+                print("WARNING: could not write last-attempt.json; " + json.dumps(attempt), file=sys.stderr)
             raise
         finally:
             db.close()
